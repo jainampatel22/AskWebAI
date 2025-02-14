@@ -1,12 +1,16 @@
+const express = require('express');
 const cheerio = require('cheerio');
 const axios = require('axios');
 const { Pinecone } = require('@pinecone-database/pinecone');
 const { GoogleGenerativeAI } = require('@google/generative-ai');
 const dotenv = require('dotenv');
-const urlParser = require('url');
-const path = require('path');
+const cors = require('cors');
 
 dotenv.config();
+
+const app = express();
+app.use(express.json());
+app.use(cors());
 
 // Initialize clients
 const pc = new Pinecone({ apiKey: process.env.PINECONE_API_KEY });
@@ -16,7 +20,6 @@ const genAI = new GoogleGenerativeAI(process.env.GEMINI_API_KEY);
 const MAX_METADATA_SIZE = 40900;
 const MAX_TOKENS = 3000;
 const MAX_DEPTH = 3;
-const VISITED_URLS = new Set();
 const MAX_RETRIES = 3;
 const RETRY_DELAY = 1000;
 
@@ -32,11 +35,8 @@ function estimateTokens(text) {
 function normalizeUrl(baseUrl, link) {
     try {
         if (!link) return null;
-        
-        // Remove hash fragments and query parameters
         link = link.split('#')[0].split('?')[0];
         
-        // Skip certain file types and protocols
         const skipExtensions = ['.pdf', '.jpg', '.png', '.gif', '.css', '.js'];
         const skipProtocols = ['mailto:', 'tel:', 'ftp:', 'file:'];
         
@@ -46,9 +46,8 @@ function normalizeUrl(baseUrl, link) {
         }
 
         const parsed = new URL(link, baseUrl);
-        
-        // Ensure same domain
         const baseUrlParsed = new URL(baseUrl);
+        
         if (parsed.hostname !== baseUrlParsed.hostname) {
             return null;
         }
@@ -76,11 +75,9 @@ const extractContent = ($) => {
         structuredData: {}
     };
 
-    // Extract META information
     contentObj.title = $('title').text().trim();
     contentObj.metaDescription = $('meta[name="description"]').attr('content') || '';
     
-    // Extract JSON-LD structured data
     $('script[type="application/ld+json"]').each((_, element) => {
         try {
             const jsonData = JSON.parse($(element).html());
@@ -90,51 +87,33 @@ const extractContent = ($) => {
         }
     });
 
-    // Function to process text content
     const processTextContent = (element) => {
         const text = $(element).text().trim();
-        if (text.length > 20) { // Ignore very short texts
+        if (text.length > 20) {
             contentObj.textContent.add(cleanText(text));
         }
     };
 
-    // Remove unwanted elements
     $('script, style, noscript, iframe, img, svg, header, footer, nav').remove();
 
-    // Priority elements
     const prioritySelectors = [
-        'article',
-        'main',
-        'section',
-        '.content',
-        '#content',
-        '.post',
-        '.article',
-        '[role="main"]',
-        '[role="article"]'
+        'article', 'main', 'section', '.content', '#content',
+        '.post', '.article', '[role="main"]', '[role="article"]'
     ];
 
-    // Process priority content first
     prioritySelectors.forEach(selector => {
-        $(selector).each((_, element) => {
-            processTextContent(element);
-        });
+        $(selector).each((_, element) => processTextContent(element));
     });
 
-    // Process headings and paragraphs
-    $('h1, h2, h3, h4, h5, h6, p').each((_, element) => {
-        processTextContent(element);
-    });
+    $('h1, h2, h3, h4, h5, h6, p').each((_, element) => processTextContent(element));
 
-    // Process list items with substantial content
     $('li').each((_, element) => {
         const text = $(element).text().trim();
-        if (text.length > 50) { // Only substantial list items
+        if (text.length > 50) {
             processTextContent(element);
         }
     });
 
-    // Process any remaining text nodes in the body
     $('body').contents().each((_, element) => {
         if (element.type === 'text') {
             const text = $(element).text().trim();
@@ -144,16 +123,14 @@ const extractContent = ($) => {
         }
     });
 
-    // Combine all unique text content
     contentObj.mainContent = Array.from(contentObj.textContent).join('\n\n');
-
     return contentObj;
 };
 
 // Web scraping function
-async function scrapeWebsite(url, depth = 0, retryCount = 0) {
-    if (VISITED_URLS.has(url) || depth > MAX_DEPTH) return null;
-    VISITED_URLS.add(url);
+async function scrapeWebsite(url, visitedUrls = new Set(), depth = 0, retryCount = 0) {
+    if (visitedUrls.has(url) || depth > MAX_DEPTH) return null;
+    visitedUrls.add(url);
 
     try {
         const response = await axios.get(url, {
@@ -168,7 +145,6 @@ async function scrapeWebsite(url, depth = 0, retryCount = 0) {
         const $ = cheerio.load(response.data);
         const contentObj = extractContent($);
 
-        // Extract links
         const internalLinks = new Set();
         $('a').each((_, element) => {
             const href = $(element).attr('href');
@@ -179,10 +155,6 @@ async function scrapeWebsite(url, depth = 0, retryCount = 0) {
         });
 
         console.log(`✅ Scraped: ${url}`);
-        console.log(`- Title: ${contentObj.title}`);
-        console.log(`- Content Length: ${contentObj.mainContent.length} chars`);
-        console.log(`- Internal Links: ${internalLinks.size}`);
-
         return {
             url,
             ...contentObj,
@@ -190,13 +162,11 @@ async function scrapeWebsite(url, depth = 0, retryCount = 0) {
         };
     } catch (error) {
         console.error(`❌ Error scraping ${url}:`, error.message);
-        
         if (retryCount < MAX_RETRIES) {
             console.log(`Retrying (${retryCount + 1}/${MAX_RETRIES})...`);
             await sleep(RETRY_DELAY);
-            return scrapeWebsite(url, depth, retryCount + 1);
+            return scrapeWebsite(url, visitedUrls, depth, retryCount + 1);
         }
-        
         return null;
     }
 }
@@ -234,10 +204,10 @@ function chunkTextBySize(text, maxSize = MAX_METADATA_SIZE) {
 }
 
 // Recursive ingestion
-async function ingestRecursive(url, depth = 0) {
+async function ingestRecursive(url, visitedUrls = new Set(), depth = 0) {
     if (depth > MAX_DEPTH) return;
 
-    const result = await scrapeWebsite(url, depth);
+    const result = await scrapeWebsite(url, visitedUrls, depth);
     if (!result) return;
 
     const index = pc.Index("dbtest");
@@ -245,7 +215,7 @@ async function ingestRecursive(url, depth = 0) {
     const contentChunks = chunkTextBySize(result.mainContent);
     for (let i = 0; i < contentChunks.length; i++) {
         const chunk = contentChunks[i];
-        if (chunk.length < 100) continue; // Skip very small chunks
+        if (chunk.length < 100) continue;
 
         const embeddingContent = await generateVector({ text: chunk });
 
@@ -265,13 +235,12 @@ async function ingestRecursive(url, depth = 0) {
         }]);
 
         console.log(`📤 Inserted chunk ${i + 1}/${contentChunks.length}`);
-        await sleep(100); // Rate limiting
+        await sleep(100);
     }
 
-    // Process internal links with rate limiting
     for (let link of result.internalLinks) {
-        await sleep(500); // Respect robots.txt timing
-        await ingestRecursive(link, depth + 1);
+        await sleep(500);
+        await ingestRecursive(link, visitedUrls, depth + 1);
     }
 }
 
@@ -314,34 +283,65 @@ async function generateAnswer(question, context) {
     return result.response.text();
 }
 
-async function handleUserQuestion(question) {
-    const context = await chat(question);
+// Single API endpoint
+app.post('/api/query', async (req, res) => {
+    try {
+        const { url, question } = req.body;
+        
+        if (!url || !question) {
+            return res.status(400).json({ 
+                success: false,
+                error: 'Missing parameters',
+                message: 'Both URL and question are required'
+            });
+        }
 
-    if (!context || context.trim().length === 0) {
-        return "I couldn't find any relevant information in the scraped data to answer your question.";
+        console.log(`🔍 Processing URL: ${url}`);
+        console.log(`❓ Question: ${question}`);
+
+        // Step 1: Scrape and ingest content
+        const visitedUrls = new Set();
+        await ingestRecursive(url, visitedUrls);
+        console.log(`📚 Processed ${visitedUrls.size} pages`);
+
+        // Step 2: Get context and generate answer
+        console.log('🤔 Generating answer...');
+        const context = await chat(question);
+        
+        if (!context || context.trim().length === 0) {
+            return res.json({
+                success: true,
+                answer: "I couldn't find any relevant information in the scraped data to answer your question.",
+                metadata: {
+                    pagesProcessed: visitedUrls.size,
+                    url: url
+                }
+            });
+        }
+
+        const answer = await generateAnswer(question, context);
+        
+        res.json({
+            success: true,
+            answer: answer,
+            metadata: {
+                pagesProcessed: visitedUrls.size,
+                url: url,
+                processedAt: new Date().toISOString()
+            }
+        });
+
+    } catch (error) {
+        console.error('❌ Error:', error);
+        res.status(500).json({ 
+            success: false,
+            error: 'Failed to process request',
+            message: error.message 
+        });
     }
+});
 
-    const answer = await generateAnswer(question, context);
-    return answer;
-}
-
-// Main execution
-async function main() {
-    const startUrl = 'https://ankit.10xdevlab.in/'; 
-    
-    console.log('🕷️ Starting web scraping...');
-    await ingestRecursive(startUrl,startUrl);
-    
-    const questions = [
-        "who is dinesh",
-       
-    ];
-
-    console.log('\n🤖 Answering questions...');
-    for (let question of questions) {
-        const answer = await handleUserQuestion(question,startUrl);
-        console.log(`\n❓ Q: ${question}\n💬 A: ${answer}\n---`);
-    }
-}
-
-main().catch(console.error);
+const PORT = process.env.PORT || 3000;
+app.listen(PORT, () => {
+    console.log(`🚀 Server running on port ${PORT}`);
+});

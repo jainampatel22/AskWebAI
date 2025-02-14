@@ -16,7 +16,10 @@
     "cheerio": "^1.0.0",
     "chromadb": "^1.10.4",
     "chromadb-default-embed": "^2.13.2",
+    "cors": "^2.8.5",
+    "curl": "^0.1.4",
     "dotenv": "^16.4.7",
+    "express": "^4.21.2",
     "gpt-3-encoder": "^1.1.4",
     "openai": "^4.82.0"
   }
