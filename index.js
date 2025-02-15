@@ -65,6 +65,24 @@ function cleanText(text) {
         .trim();
 }
 
+function validateAndFormatUrl(url) {
+    try {
+        // Remove any remaining URL encoding
+        let cleanUrl = url.replace(/%..,/g, '');
+        
+        // If the URL doesn't start with http:// or https://, add https://
+        if (!cleanUrl.startsWith('http://') && !cleanUrl.startsWith('https://')) {
+            cleanUrl = 'https://' + cleanUrl;
+        }
+        
+        // Create and validate URL object
+        const urlObject = new URL(cleanUrl);
+        return urlObject.toString();
+    } catch (error) {
+        throw new Error(`Invalid URL format: ${url}`);
+    }
+}
+
 // Content extraction
 const extractContent = ($) => {
     let contentObj = {
@@ -139,7 +157,9 @@ async function scrapeWebsite(url, visitedUrls = new Set(), depth = 0, retryCount
                 'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',
                 'Accept-Language': 'en-US,en;q=0.5'
             },
-            timeout: 10000
+            timeout: 30000, // Increased timeout to 30 seconds
+            maxContentLength: 10000000, // 10MB max content length
+            maxBodyLength: 10000000 // 10MB max body length
         });
 
         const $ = cheerio.load(response.data);
@@ -164,7 +184,7 @@ async function scrapeWebsite(url, visitedUrls = new Set(), depth = 0, retryCount
         console.error(`❌ Error scraping ${url}:`, error.message);
         if (retryCount < MAX_RETRIES) {
             console.log(`Retrying (${retryCount + 1}/${MAX_RETRIES})...`);
-            await sleep(RETRY_DELAY);
+            await sleep(RETRY_DELAY * (retryCount + 1)); // Progressive delay
             return scrapeWebsite(url, visitedUrls, depth, retryCount + 1);
         }
         return null;
@@ -203,66 +223,91 @@ function chunkTextBySize(text, maxSize = MAX_METADATA_SIZE) {
     return chunks;
 }
 
+// Delete old vectors
+async function deleteOldVectors(namespace) {
+    const index = pc.Index("dbtrail");
+    try {
+        const vectorIds = await index.describeIndexStats();
+        const namespaceIds = vectorIds.namespaces;
+        
+        if (namespaceIds && namespaceIds[namespace]) {
+            await index.deleteAll();
+            console.log(`🗑️ Cleaned up old vectors`);
+        }
+    } catch (error) {
+        console.warn('Warning: Error during vector cleanup:', error.message);
+    }
+}
+
 // Recursive ingestion
-async function ingestRecursive(url, visitedUrls = new Set(), depth = 0) {
+async function ingestRecursive(url, visitedUrls = new Set(), depth = 0, namespace) {
     if (depth > MAX_DEPTH) return;
 
     const result = await scrapeWebsite(url, visitedUrls, depth);
     if (!result) return;
 
-    const index = pc.Index("dbtest");
+    const index = pc.Index("dbtrail");
 
     const contentChunks = chunkTextBySize(result.mainContent);
     for (let i = 0; i < contentChunks.length; i++) {
         const chunk = contentChunks[i];
         if (chunk.length < 100) continue;
 
-        const embeddingContent = await generateVector({ text: chunk });
+        try {
+            const embeddingContent = await generateVector({ text: chunk });
 
-        const metadata = {
-            source: 'content',
-            content: chunk,
-            url: result.url,
-            title: result.title,
-            metaDescription: result.metaDescription,
-            timestamp: new Date().toISOString()
-        };
+            const metadata = {
+                content: chunk,
+                url: result.url,
+                title: result.title,
+                timestamp: new Date().toISOString()
+            };
 
-        await index.upsert([{
-            id: `content_${Date.now()}_${i}`,
-            values: embeddingContent,
-            metadata
-        }]);
+            await index.upsert([{
+                id: `${Date.now()}_${i}`,
+                values: embeddingContent,
+                metadata
+            }]);
 
-        console.log(`📤 Inserted chunk ${i + 1}/${contentChunks.length}`);
-        await sleep(100);
+            console.log(`📤 Inserted chunk ${i + 1}/${contentChunks.length}`);
+            await sleep(100);
+        } catch (error) {
+            console.error(`Error inserting chunk ${i}:`, error.message);
+            continue;
+        }
     }
 
     for (let link of result.internalLinks) {
-        await sleep(500);
-        await ingestRecursive(link, visitedUrls, depth + 1);
+        await sleep(1000); // Increased delay between pages
+        await ingestRecursive(link, visitedUrls, depth + 1, namespace);
     }
 }
 
 // Question handling
-async function chat(question) {
-    const index = pc.Index("dbtest");
+async function chat(question, namespace) {
+    const index = pc.Index("dbtrail");
     const questionEmbedding = await generateVector({ text: question });
     
-    const result = await index.query({
-        vector: questionEmbedding,
-        topK: 5,
-        includeMetadata: true
-    });
+    try {
+        const result = await index.query({
+            vector: questionEmbedding,
+            topK: 5,
+            includeMetadata: true
+        });
 
-    const context = result.matches
-        .map(match => match.metadata.content)
-        .filter(content => content && content.length > 100)
-        .join('\n\n');
+        const context = result.matches
+            .map(match => match.metadata.content)
+            .filter(content => content && content.length > 100)
+            .join('\n\n');
 
-    return context;
+        return context;
+    } catch (error) {
+        console.error('Error querying Pinecone:', error);
+        return '';
+    }
 }
 
+// Answer generation
 async function generateAnswer(question, context) {
     const model = genAI.getGenerativeModel({ model: "gemini-pro" });
 
@@ -283,10 +328,10 @@ async function generateAnswer(question, context) {
     return result.response.text();
 }
 
-// Single API endpoint
-app.post('/api/query', async (req, res) => {
+// API endpoint
+app.post('/api/ask', async (req, res) => {
     try {
-        const { url, question } = req.body;
+        let { url, question } = req.body;
         
         if (!url || !question) {
             return res.status(400).json({ 
@@ -296,17 +341,42 @@ app.post('/api/query', async (req, res) => {
             });
         }
 
+        // Clean and validate URL
+        try {
+            url = validateAndFormatUrl(url);
+        } catch (error) {
+            return res.status(400).json({
+                success: false,
+                error: 'Invalid URL',
+                message: error.message
+            });
+        }
+
         console.log(`🔍 Processing URL: ${url}`);
         console.log(`❓ Question: ${question}`);
 
-        // Step 1: Scrape and ingest content
+        // Generate a namespace for this URL session
+        const namespace = `ns_${Date.now()}`;
+
+        // Clean up old vectors if any
+        await deleteOldVectors(namespace);
+
+        // Scrape and ingest content
         const visitedUrls = new Set();
-        await ingestRecursive(url, visitedUrls);
+        await ingestRecursive(url, visitedUrls, 0, namespace);
         console.log(`📚 Processed ${visitedUrls.size} pages`);
 
-        // Step 2: Get context and generate answer
+        if (visitedUrls.size === 0) {
+            return res.status(400).json({
+                success: false,
+                error: 'Scraping failed',
+                message: 'Unable to scrape content from the provided URL'
+            });
+        }
+
+        // Get context and generate answer
         console.log('🤔 Generating answer...');
-        const context = await chat(question);
+        const context = await chat(question, namespace);
         
         if (!context || context.trim().length === 0) {
             return res.json({
@@ -341,7 +411,7 @@ app.post('/api/query', async (req, res) => {
     }
 });
 
-const PORT = process.env.PORT || 3000;
+const PORT = process.env.PORT || 4000;
 app.listen(PORT, () => {
     console.log(`🚀 Server running on port ${PORT}`);
 });
