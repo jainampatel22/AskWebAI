@@ -5,13 +5,24 @@ const { Pinecone } = require('@pinecone-database/pinecone');
 const { GoogleGenerativeAI } = require('@google/generative-ai');
 const dotenv = require('dotenv');
 const cors = require('cors');
-
+// const {Redis} = require('@upstash/redis')
+const Redis = require('ioredis');
+const CACHE_EXPIRY_SECONDS = 3600;
 dotenv.config();
 
 const app = express();
 app.use(express.json());
 app.use(cors());
-
+// const redis = new Redis({
+//     url:process.env.UPSTASH_REDIS_REST_URL,
+//     token:process.env.UPSTASH_REDIS_REST_TOKEN
+// })
+const redis = new Redis({
+    host: 'tender-mosquito-42163.upstash.io', // Upstash Redis instance URL
+    port: 6379, // Port for Redis connection
+    password: 'AaSzAAIjcDE4YjQ3YzI2ZWMzMTc0NzY5YmY0ODRkY2U4OGUxMWNiZHAxMA', // Upstash Redis password
+    tls: {} // Secure connection settings
+  });
 // Initialize clients
 const pc = new Pinecone({ apiKey: process.env.PINECONE_API_KEY });
 const genAI = new GoogleGenerativeAI(process.env.GEMINI_API_KEY);
@@ -226,6 +237,7 @@ function chunkTextBySize(text, maxSize = MAX_METADATA_SIZE) {
 // Delete old vectors
 async function deleteOldVectors(namespace) {
     const index = pc.Index("dbtrail");
+    
     try {
         const vectorIds = await index.describeIndexStats();
         const namespaceIds = vectorIds.namespaces;
@@ -363,7 +375,14 @@ app.post('/api/ask', async (req, res) => {
 
         // Scrape and ingest content
         const visitedUrls = new Set();
-        await ingestRecursive(url, visitedUrls, 0, namespace);
+        const cachedData = await redis.get(url);
+        if(cachedData){
+            console.log("from redis")
+            return res.json(JSON.parse(cachedData))
+        }
+       const scrappedData= await ingestRecursive(url, visitedUrls, 0, namespace);
+       await redis.set(url, JSON.stringify(scrappedData), 'EX', 3600); // Cache for 1 hour
+
         console.log(`📚 Processed ${visitedUrls.size} pages`);
 
         if (visitedUrls.size === 0) {
@@ -390,7 +409,7 @@ app.post('/api/ask', async (req, res) => {
         }
 
         const answer = await generateAnswer(question, context);
-        
+        await deleteOldVectors(namespace);
         res.json({
             success: true,
             answer: answer,
