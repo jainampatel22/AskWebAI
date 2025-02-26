@@ -236,7 +236,7 @@ function chunkTextBySize(text, maxSize = MAX_METADATA_SIZE) {
 
 // Delete old vectors
 async function deleteOldVectors(namespace) {
-    const index = pc.Index("dbtrail");
+    const index = pc.Index("final-trial");
     
     try {
         const vectorIds = await index.describeIndexStats();
@@ -258,7 +258,7 @@ async function ingestRecursive(url, visitedUrls = new Set(), depth = 0, namespac
     const result = await scrapeWebsite(url, visitedUrls, depth);
     if (!result) return;
 
-    const index = pc.Index("dbtrail");
+    const index = pc.Index("final-trial");
 
     const contentChunks = chunkTextBySize(result.mainContent);
     for (let i = 0; i < contentChunks.length; i++) {
@@ -288,16 +288,17 @@ async function ingestRecursive(url, visitedUrls = new Set(), depth = 0, namespac
             continue;
         }
     }
-
     for (let link of result.internalLinks) {
         await sleep(1000); // Increased delay between pages
         await ingestRecursive(link, visitedUrls, depth + 1, namespace);
     }
+
 }
 
 // Question handling
 async function chat(question, namespace) {
-    const index = pc.Index("dbtrail");
+    const index = pc.Index("final-trial");
+    
     const questionEmbedding = await generateVector({ text: question });
     
     try {
@@ -321,7 +322,9 @@ async function chat(question, namespace) {
 
 // Answer generation
 async function generateAnswer(question, context) {
-    const model = genAI.getGenerativeModel({ model: "gemini-pro" });
+    const model = genAI.getGenerativeModel({ model: "gemini-1.5-pro" }, {
+        apiVersion: 'v1beta',
+    });
 
     let finalContext = context;
     while (estimateTokens(question + finalContext) > MAX_TOKENS) {
