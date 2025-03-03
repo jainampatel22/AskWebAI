@@ -5,24 +5,22 @@ const { Pinecone } = require('@pinecone-database/pinecone');
 const { GoogleGenerativeAI } = require('@google/generative-ai');
 const dotenv = require('dotenv');
 const cors = require('cors');
-// const {Redis} = require('@upstash/redis')
 const Redis = require('ioredis');
+const crypto = require('crypto');
 const CACHE_EXPIRY_SECONDS = 3600;
 dotenv.config();
 
 const app = express();
 app.use(express.json());
 app.use(cors());
-// const redis = new Redis({
-//     url:process.env.UPSTASH_REDIS_REST_URL,
-//     token:process.env.UPSTASH_REDIS_REST_TOKEN
-// })
+
 const redis = new Redis({
-    host: 'tender-mosquito-42163.upstash.io', // Upstash Redis instance URL
-    port: 6379, // Port for Redis connection
-    password: 'AaSzAAIjcDE4YjQ3YzI2ZWMzMTc0NzY5YmY0ODRkY2U4OGUxMWNiZHAxMA', // Upstash Redis password
-    tls: {} // Secure connection settings
-  });
+    host: 'tender-mosquito-42163.upstash.io',
+    port: 6379,
+    password: 'AaSzAAIjcDE4YjQ3YzI2ZWMzMTc0NzY5YmY0ODRkY2U4OGUxMWNiZHAxMA',
+    tls: {}
+});
+
 // Initialize clients
 const pc = new Pinecone({ apiKey: process.env.PINECONE_API_KEY });
 const genAI = new GoogleGenerativeAI(process.env.GEMINI_API_KEY);
@@ -37,6 +35,19 @@ const RETRY_DELAY = 1000;
 // Utility functions
 function sleep(ms) {
     return new Promise(resolve => setTimeout(resolve, ms));
+}
+
+// Create a consistent namespace from a URL
+function createNamespaceFromUrl(url) {
+    // Extract domain and path
+    const urlObj = new URL(url);
+    const domain = urlObj.hostname.replace(/\./g, '_');
+    
+    // Hash the full URL to ensure uniqueness and valid namespace format
+    const hash = crypto.createHash('md5').update(url).digest('hex').substring(0, 10);
+    
+    // Create namespace with domain and hash
+    return `${domain}_${hash}`;
 }
 
 function estimateTokens(text) {
@@ -168,9 +179,9 @@ async function scrapeWebsite(url, visitedUrls = new Set(), depth = 0, retryCount
                 'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',
                 'Accept-Language': 'en-US,en;q=0.5'
             },
-            timeout: 30000, // Increased timeout to 30 seconds
-            maxContentLength: 10000000, // 10MB max content length
-            maxBodyLength: 10000000 // 10MB max body length
+            timeout: 30000,
+            maxContentLength: 10000000,
+            maxBodyLength: 10000000
         });
 
         const $ = cheerio.load(response.data);
@@ -195,7 +206,7 @@ async function scrapeWebsite(url, visitedUrls = new Set(), depth = 0, retryCount
         console.error(`❌ Error scraping ${url}:`, error.message);
         if (retryCount < MAX_RETRIES) {
             console.log(`Retrying (${retryCount + 1}/${MAX_RETRIES})...`);
-            await sleep(RETRY_DELAY * (retryCount + 1)); // Progressive delay
+            await sleep(RETRY_DELAY * (retryCount + 1));
             return scrapeWebsite(url, visitedUrls, depth, retryCount + 1);
         }
         return null;
@@ -210,44 +221,54 @@ async function generateVector({ text }) {
 }
 
 // Content chunking
-function chunkTextBySize(text, maxSize = MAX_METADATA_SIZE) {
+function chunkText(text, maxBytes = 10000) {
+    const encoder = new TextEncoder();
+    const words = text.split(" ");
     let chunks = [];
-    let currentChunk = '';
-    const sentences = text.split(/[.!?]+/);
+    let currentChunk = [];
 
-    for (let sentence of sentences) {
-        sentence = sentence.trim();
-        if (!sentence) continue;
+    let currentSize = 0;
 
-        const potentialChunk = currentChunk ? currentChunk + '. ' + sentence : sentence;
-        const chunkSize = Buffer.byteLength(potentialChunk, 'utf8');
+    for (const word of words) {
+        const wordSize = encoder.encode(word + " ").length; // Get byte size
 
-        if (chunkSize > maxSize) {
-            if (currentChunk) chunks.push(currentChunk);
-            currentChunk = sentence;
-        } else {
-            currentChunk = potentialChunk;
+        if (currentSize + wordSize > maxBytes) {
+            chunks.push(currentChunk.join(" "));
+            currentChunk = [];
+            currentSize = 0;
         }
+
+        currentChunk.push(word);
+        currentSize += wordSize;
     }
 
-    if (currentChunk) chunks.push(currentChunk);
+    if (currentChunk.length > 0) {
+        chunks.push(currentChunk.join(" "));
+    }
+
     return chunks;
 }
 
-// Delete old vectors
-async function deleteOldVectors(namespace) {
+
+// Delete vectors for a specific namespace
+async function deleteNamespaceVectors(namespace) {
     const index = pc.Index("final-trial");
     
     try {
-        const vectorIds = await index.describeIndexStats();
-        const namespaceIds = vectorIds.namespaces;
+        // Check if the namespace exists
+        const stats = await index.describeIndexStats();
+        const namespaces = stats.namespaces || {};
         
-        if (namespaceIds && namespaceIds[namespace]) {
-            await index.deleteAll();
-            console.log(`🗑️ Cleaned up old vectors`);
+        if (namespaces[namespace]) {
+            // Delete only vectors in this namespace
+            await index.delete1({
+                deleteAll: true,
+                namespace: namespace
+            });
+            console.log(`🗑️ Cleaned up vectors in namespace: ${namespace}`);
         }
     } catch (error) {
-        console.warn('Warning: Error during vector cleanup:', error.message);
+        console.warn(`Warning: Error during cleanup of namespace ${namespace}:`, error.message);
     }
 }
 
@@ -260,7 +281,7 @@ async function ingestRecursive(url, visitedUrls = new Set(), depth = 0, namespac
 
     const index = pc.Index("final-trial");
 
-    const contentChunks = chunkTextBySize(result.mainContent);
+    const contentChunks = chunkText(result.mainContent);
     for (let i = 0; i < contentChunks.length; i++) {
         const chunk = contentChunks[i];
         if (chunk.length < 100) continue;
@@ -275,24 +296,30 @@ async function ingestRecursive(url, visitedUrls = new Set(), depth = 0, namespac
                 timestamp: new Date().toISOString()
             };
 
-            await index.upsert([{
-                id: `${Date.now()}_${i}`,
+            await index.namespace(namespace).upsert([{
+                id: `${namespace}_${Date.now()}_${i}`,
                 values: embeddingContent,
                 metadata
             }]);
+            
 
-            console.log(`📤 Inserted chunk ${i + 1}/${contentChunks.length}`);
+            console.log(`📤 Inserted chunk ${i + 1}/${contentChunks.length} into namespace: ${namespace}`);
             await sleep(100);
         } catch (error) {
             console.error(`Error inserting chunk ${i}:`, error.message);
             continue;
         }
     }
+    
     for (let link of result.internalLinks) {
-        await sleep(1000); // Increased delay between pages
+        await sleep(1000);
         await ingestRecursive(link, visitedUrls, depth + 1, namespace);
     }
 
+    return {
+        pageCount: visitedUrls.size,
+        namespace: namespace
+    };
 }
 
 // Question handling
@@ -300,12 +327,12 @@ async function chat(question, namespace) {
     const index = pc.Index("final-trial");
     
     const questionEmbedding = await generateVector({ text: question });
-    
     try {
-        const result = await index.query({
+        const result = await index.namespace(namespace).query({
             vector: questionEmbedding,
             topK: 5,
-            includeMetadata: true
+            includeMetadata: true,
+            // Query only within this namespace
         });
 
         const context = result.matches
@@ -315,7 +342,7 @@ async function chat(question, namespace) {
 
         return context;
     } catch (error) {
-        console.error('Error querying Pinecone:', error);
+        console.error(`Error querying Pinecone namespace ${namespace}:`, error);
         return '';
     }
 }
@@ -370,58 +397,83 @@ app.post('/api/ask', async (req, res) => {
         console.log(`🔍 Processing URL: ${url}`);
         console.log(`❓ Question: ${question}`);
 
-        // Generate a namespace for this URL session
-        const namespace = `ns_${Date.now()}`;
+        // Generate a consistent namespace for this URL
+        const namespace = createNamespaceFromUrl(url);
+        console.log(`📁 Using namespace: ${namespace}`);
 
-        // Clean up old vectors if any
-        await deleteOldVectors(namespace);
-
-        // Scrape and ingest content
-        const visitedUrls = new Set();
-        const cachedData = await redis.get(url);
-        if(cachedData){
-            console.log("from redis")
-            return res.json(JSON.parse(cachedData))
+        // Check Redis cache first
+        const redisKey = `${namespace}:${question}`;
+        const cachedAnswer = await redis.get(redisKey);
+        
+        if (cachedAnswer) {
+            console.log("✅ Retrieved from Redis cache");
+            return res.json(JSON.parse(cachedAnswer));
         }
-       const scrappedData= await ingestRecursive(url, visitedUrls, 0, namespace);
-       await redis.set(url, JSON.stringify(scrappedData), 'EX', 3600); // Cache for 1 hour
 
-        console.log(`📚 Processed ${visitedUrls.size} pages`);
+        // Check if namespace exists in Pinecone
+        const index = pc.Index("final-trial");
+        const stats = await index.describeIndexStats();
+        const namespaces = stats.namespaces || {};
+        const urlNeedsIngestion = !namespaces[namespace] || namespaces[namespace].vectorCount === 0;
 
-        if (visitedUrls.size === 0) {
-            return res.status(400).json({
-                success: false,
-                error: 'Scraping failed',
-                message: 'Unable to scrape content from the provided URL'
-            });
+        let ingestData;
+        if (urlNeedsIngestion) {
+            console.log(`🔄 No data found for this URL, ingesting content...`);
+            
+            // Scrape and ingest content
+            const visitedUrls = new Set();
+            ingestData = await ingestRecursive(url, visitedUrls, 0, namespace);
+            
+            console.log(`📚 Processed ${visitedUrls.size} pages into namespace: ${namespace}`);
+            
+            if (visitedUrls.size === 0) {
+                return res.status(400).json({
+                    success: false,
+                    error: 'Scraping failed',
+                    message: 'Unable to scrape content from the provided URL'
+                });
+            }
+        } else {
+            console.log(`📚 Found existing namespace with ${namespaces[namespace].vectorCount} vectors`);
         }
 
         // Get context and generate answer
-        console.log('🤔 Generating answer...');
+        console.log(`🤔 Generating answer for namespace: ${namespace}...`);
         const context = await chat(question, namespace);
         
         if (!context || context.trim().length === 0) {
-            return res.json({
+            const response = {
                 success: true,
                 answer: "I couldn't find any relevant information in the scraped data to answer your question.",
                 metadata: {
-                    pagesProcessed: visitedUrls.size,
-                    url: url
+                    namespace: namespace,
+                    url: url,
+                    processedAt: new Date().toISOString()
                 }
-            });
+            };
+            
+            // Cache the response
+            await redis.set(redisKey, JSON.stringify(response), 'EX', CACHE_EXPIRY_SECONDS);
+            
+            return res.json(response);
         }
 
         const answer = await generateAnswer(question, context);
-        await deleteOldVectors(namespace);
-        res.json({
+        
+        const response = {
             success: true,
             answer: answer,
             metadata: {
-                pagesProcessed: visitedUrls.size,
+                namespace: namespace,
                 url: url,
                 processedAt: new Date().toISOString()
             }
-        });
+        };
+        
+        // Cache the response
+        await redis.set(redisKey, JSON.stringify(response), 'EX', CACHE_EXPIRY_SECONDS);
+        
+        res.json(response);
 
     } catch (error) {
         console.error('❌ Error:', error);
