@@ -444,7 +444,7 @@ app.post('/api/ask', async (req, res) => {
         if (!context || context.trim().length === 0) {
             const response = {
                 success: true,
-                answer: "I couldn't find any relevant information in the scraped data to answer your question.",
+                answer: "Sorry, I couldn't find any relevant information to answer your question. You can try asking diffrent Question!",
                 metadata: {
                     namespace: namespace,
                     url: url,
