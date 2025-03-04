@@ -188,7 +188,9 @@ async function scrapeWebsite(url, visitedUrls = new Set(), depth = 0, retryCount
         const contentObj = extractContent($);
 
         const internalLinks = new Set();
+        
         $('a').each((_, element) => {
+
             const href = $(element).attr('href');
             const normalizedUrl = normalizeUrl(url, href);
             if (normalizedUrl) {
@@ -250,30 +252,8 @@ function chunkText(text, maxBytes = 10000) {
 }
 
 
-// Delete vectors for a specific namespace
-async function deleteNamespaceVectors(namespace) {
-    const index = pc.Index("final-trial");
-    
-    try {
-        // Check if the namespace exists
-        const stats = await index.describeIndexStats();
-        const namespaces = stats.namespaces || {};
-        
-        if (namespaces[namespace]) {
-            // Delete only vectors in this namespace
-            await index.delete1({
-                deleteAll: true,
-                namespace: namespace
-            });
-            console.log(`🗑️ Cleaned up vectors in namespace: ${namespace}`);
-        }
-    } catch (error) {
-        console.warn(`Warning: Error during cleanup of namespace ${namespace}:`, error.message);
-    }
-}
-
 // Recursive ingestion
-async function ingestRecursive(url, visitedUrls = new Set(), depth = 0, namespace) {
+async function ingestRecursive(url, visitedUrls = new Set(), depth = 0, namespace, maxInternalLinks = 5) {
     if (depth > MAX_DEPTH) return;
 
     const result = await scrapeWebsite(url, visitedUrls, depth);
@@ -302,7 +282,6 @@ async function ingestRecursive(url, visitedUrls = new Set(), depth = 0, namespac
                 metadata
             }]);
             
-
             console.log(`📤 Inserted chunk ${i + 1}/${contentChunks.length} into namespace: ${namespace}`);
             await sleep(100);
         } catch (error) {
@@ -311,9 +290,12 @@ async function ingestRecursive(url, visitedUrls = new Set(), depth = 0, namespac
         }
     }
     
-    for (let link of result.internalLinks) {
+    // Limit the number of internal links scraped
+    const linksToScrape = result.internalLinks.slice(0, maxInternalLinks);
+    
+    for (let link of linksToScrape) {
         await sleep(1000);
-        await ingestRecursive(link, visitedUrls, depth + 1, namespace);
+        await ingestRecursive(link, visitedUrls, depth + 1, namespace, maxInternalLinks);
     }
 
     return {
