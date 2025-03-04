@@ -13,7 +13,7 @@ dotenv.config();
 const app = express();
 
 const corsOptions = {
-    origin: ["http://localhost:4000"],
+    origin: ["https://askweb-dusky.vercel.app","http://localhost:4000"],
     methods: ["GET", "POST", "PUT", "DELETE"],
     allowedHeaders: ["Content-Type", "Authorization"],
     exposedHeaders: ["Custom-Header"],
