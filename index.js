@@ -11,9 +11,18 @@ const CACHE_EXPIRY_SECONDS = 3600;
 dotenv.config();
 
 const app = express();
-app.use(express.json());
-app.use(cors());
 
+const corsOptions = {
+    origin: ["http://localhost:4000"],
+    methods: ["GET", "POST", "PUT", "DELETE"],
+    allowedHeaders: ["Content-Type", "Authorization"],
+    exposedHeaders: ["Custom-Header"],
+    credentials: true,
+    optionsSuccessStatus: 200,
+};
+app.use(cors(corsOptions));
+
+app.use(express.json());
 const redis = new Redis({
     host: 'tender-mosquito-42163.upstash.io',
     port: 6379,
@@ -467,7 +476,22 @@ app.post('/api/ask', async (req, res) => {
     }
 });
 
+
+const ping = ()=>{
+const url = 'https://askweb-backend.onrender.com'
+setInterval(async()=>{
+    try {
+        const response = await fetch(url)
+        console("keeping backend alive ping",response.status)
+    } catch (error) {
+        console.log("ping failed",error)
+    }
+},36000000)
+}
+ping()
+
 const PORT = process.env.PORT || 4000;
+
 app.listen(PORT, () => {
     console.log(`🚀 Server running on port ${PORT}`);
 });
