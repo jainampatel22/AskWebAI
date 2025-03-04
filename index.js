@@ -14,11 +14,9 @@ const app = express();
 
 const corsOptions = {
     origin: ["https://webseer.vercel.app"],
-    methods: ["GET", "POST", "PUT", "DELETE"],
     allowedHeaders: ["Content-Type", "Authorization"],
-    exposedHeaders: ["Custom-Header"],
-    credentials: true,
-    optionsSuccessStatus: 200,
+    
+    
 };
 app.use(cors(corsOptions));
 
