@@ -338,25 +338,43 @@ async function chat(question, namespace) {
 
 // Answer generation
 async function generateAnswer(question, context) {
-    const model = genAI.getGenerativeModel({ model: "gemini-1.5-pro" }, {
-        apiVersion: 'v1beta',
-    });
+    try {
+        const model = genAI.getGenerativeModel({ model: "gemini-1.5-pro" }, {
+            apiVersion: 'v1beta',
+        });
 
-    let finalContext = context;
-    while (estimateTokens(question + finalContext) > MAX_TOKENS) {
-        finalContext = finalContext.slice(0, -1000);
+        let finalContext = context;
+        while (estimateTokens(question + finalContext) > MAX_TOKENS) {
+            finalContext = finalContext.slice(0, -1000);
+        }
+
+        const prompt = `You are an assistant with full context of the question. Answer accurately based on the provided context. If the context doesn't contain enough information to answer the question, say so directly.
+
+        Question: ${question}
+
+        Context: ${finalContext}
+
+        Answer:`;
+
+        const result = await model.generateContent(prompt);
+        return result.response.text();
+    } catch (error) {
+        console.error('❌ API Error:', error);
+
+        // Categorize and handle different types of errors
+        if (error.message.includes('429')) {
+            return "Sorry, I'm experiencing high load. Please try again later.";
+        } else if (error.message.includes('401') || error.message.includes('403')) {
+            return "Authentication error. Please check the API configuration.";
+        } else if (error.message.includes('500') || error.message.includes('503')) {
+            return "The AI service is currently unavailable. Please try again later.";
+        } else if (error.message.includes('network') || error.message.includes('timeout')) {
+            return "Network error occurred. Please check your internet connection.";
+        } else {
+            // Generic error message for unexpected errors
+            return "An unexpected error occurred while generating the answer. Please try again.";
+        }
     }
-
-    const prompt = `You are an assistant with full context of the question. Answer accurately based on the provided context. If the context doesn't contain enough information to answer the question, say so directly.
-
-    Question: ${question}
-
-    Context: ${finalContext}
-
-    Answer:`;
-
-    const result = await model.generateContent(prompt);
-    return result.response.text();
 }
 
 // API endpoint
