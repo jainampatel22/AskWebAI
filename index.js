@@ -30,7 +30,7 @@ const redis = new Redis({
 
 // Initialize clients
 const pc = new Pinecone({ apiKey: process.env.PINECONE_API_KEY });
-const genAI = new GoogleGenerativeAI(AIzaSyBmMEjUihx7A2nXWVt1ELWeyNiMtAXmlsw);
+const genAI = new GoogleGenerativeAI('AIzaSyBmMEjUihx7A2nXWVt1ELWeyNiMtAXmlsw');
 
 // Constants
 const MAX_METADATA_SIZE = 40900;
