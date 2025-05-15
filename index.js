@@ -22,9 +22,9 @@ app.use(cors(corsOptions));
 
 app.use(express.json());
 const redis = new Redis({
-    host: 'tender-mosquito-42163.upstash.io',
+    host: 'grown-kite-35323.upstash.io',
     port: 6379,
-    password: 'AaSzAAIjcDE4YjQ3YzI2ZWMzMTc0NzY5YmY0ODRkY2U4OGUxMWNiZHAxMA',
+    password: 'AYn7AAIjcDE0ZjMwNDAyYTJkMjA0MzFhODE2NzIyY2YxMzE0MDNiZHAxMA',
     tls: {}
 });
 
