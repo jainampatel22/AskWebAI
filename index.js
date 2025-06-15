@@ -5,7 +5,7 @@ const { Pinecone } = require('@pinecone-database/pinecone');
 const { GoogleGenerativeAI } = require('@google/generative-ai');
 const dotenv = require('dotenv');
 const cors = require('cors');
-const Redis = require('ioredis');
+
 const crypto = require('crypto');
 const CACHE_EXPIRY_SECONDS = 3600;
 dotenv.config();
@@ -21,12 +21,7 @@ const corsOptions = {
 app.use(cors(corsOptions));
 
 app.use(express.json());
-const redis = new Redis({
-    host: 'grown-kite-35323.upstash.io',
-    port: 6379,
-    password: 'AYn7AAIjcDE0ZjMwNDAyYTJkMjA0MzFhODE2NzIyY2YxMzE0MDNiZHAxMA',
-    tls: {}
-});
+
 
 // Initialize clients
 const pc = new Pinecone({ apiKey: process.env.PINECONE_API_KEY });
@@ -460,7 +455,7 @@ app.post('/api/ask', async (req, res) => {
             };
             
             // Cache the response
-            await redis.set(redisKey, JSON.stringify(response), 'EX', CACHE_EXPIRY_SECONDS);
+            
             
             return res.json(response);
         }
@@ -478,7 +473,7 @@ app.post('/api/ask', async (req, res) => {
         };
         
         // Cache the response
-        await redis.set(redisKey, JSON.stringify(response), 'EX', CACHE_EXPIRY_SECONDS);
+       
         
         res.json(response);
 
