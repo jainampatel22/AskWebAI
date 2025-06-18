@@ -2,7 +2,6 @@ const express = require('express');
 const cheerio = require('cheerio');
 const axios = require('axios');
 const { Pinecone } = require('@pinecone-database/pinecone');
-const { GoogleGenerativeAI } = require('@google/generative-ai');
 const dotenv = require('dotenv');
 const cors = require('cors');
 
@@ -13,26 +12,75 @@ dotenv.config();
 const app = express();
 
 const corsOptions = {
-    origin: ["https://webseer.vercel.app"],
+    origin: ['https://webseer.vercel.app'],
     allowedHeaders: ["Content-Type", "Authorization"],
-    
-    
 };
 app.use(cors(corsOptions));
-
 app.use(express.json());
-
 
 // Initialize clients
 const pc = new Pinecone({ apiKey: process.env.PINECONE_API_KEY });
-const genAI = new GoogleGenerativeAI('AIzaSyBmMEjUihx7A2nXWVt1ELWeyNiMtAXmlsw');
 
 // Constants
 const MAX_METADATA_SIZE = 40900;
-const MAX_TOKENS = 3000;
+const MAX_TOKENS = 8000; // Mistral context window
 const MAX_DEPTH = 3;
 const MAX_RETRIES = 3;
 const RETRY_DELAY = 1000;
+
+// Mistral API configuration
+const MISTRAL_API_KEY = process.env.MISTRAL_API_KEY;
+const MISTRAL_BASE_URL = 'https://api.mistral.ai/v1';
+
+// Rate limiting for API calls
+const API_RATE_LIMIT = {
+    requestsPerMinute: 30, // Mistral has higher limits
+    minDelayBetweenCalls: 2000, // 2 seconds between calls
+};
+
+let apiCallTracker = {
+    calls: [],
+    lastCall: 0
+};
+
+// Enhanced rate limiting function
+async function rateLimitedApiCall(apiFunction, ...args) {
+    const now = Date.now();
+    
+    // Clean old calls (older than 1 minute)
+    apiCallTracker.calls = apiCallTracker.calls.filter(time => now - time < 60000);
+    
+    // Check if we've exceeded rate limits
+    if (apiCallTracker.calls.length >= API_RATE_LIMIT.requestsPerMinute) {
+        const waitTime = 60000 - (now - apiCallTracker.calls[0]);
+        console.log(`⏳ Rate limit reached. Waiting ${Math.ceil(waitTime/1000)} seconds...`);
+        await sleep(waitTime);
+        return rateLimitedApiCall(apiFunction, ...args);
+    }
+    
+    // Ensure minimum delay between calls
+    const timeSinceLastCall = now - apiCallTracker.lastCall;
+    if (timeSinceLastCall < API_RATE_LIMIT.minDelayBetweenCalls) {
+        const waitTime = API_RATE_LIMIT.minDelayBetweenCalls - timeSinceLastCall;
+        console.log(`⏳ Enforcing minimum delay. Waiting ${Math.ceil(waitTime/1000)} seconds...`);
+        await sleep(waitTime);
+    }
+    
+    try {
+        const result = await apiFunction(...args);
+        apiCallTracker.calls.push(Date.now());
+        apiCallTracker.lastCall = Date.now();
+        return result;
+    } catch (error) {
+        if (error.response?.status === 429 || error.message.includes('429')) {
+            const retryDelay = 60000; // Wait 60s on rate limit
+            console.log(`🚫 429 Error - Waiting ${Math.ceil(retryDelay/1000)} seconds before retry...`);
+            await sleep(retryDelay);
+            return rateLimitedApiCall(apiFunction, ...args);
+        }
+        throw error;
+    }
+}
 
 // Utility functions
 function sleep(ms) {
@@ -41,14 +89,9 @@ function sleep(ms) {
 
 // Create a consistent namespace from a URL
 function createNamespaceFromUrl(url) {
-    // Extract domain and path
     const urlObj = new URL(url);
     const domain = urlObj.hostname.replace(/\./g, '_');
-    
-    // Hash the full URL to ensure uniqueness and valid namespace format
     const hash = crypto.createHash('md5').update(url).digest('hex').substring(0, 10);
-    
-    // Create namespace with domain and hash
     return `${domain}_${hash}`;
 }
 
@@ -91,15 +134,12 @@ function cleanText(text) {
 
 function validateAndFormatUrl(url) {
     try {
-        // Remove any remaining URL encoding
         let cleanUrl = url.replace(/%..,/g, '');
         
-        // If the URL doesn't start with http:// or https://, add https://
         if (!cleanUrl.startsWith('http://') && !cleanUrl.startsWith('https://')) {
             cleanUrl = 'https://' + cleanUrl;
         }
         
-        // Create and validate URL object
         const urlObject = new URL(cleanUrl);
         return urlObject.toString();
     } catch (error) {
@@ -192,7 +232,6 @@ async function scrapeWebsite(url, visitedUrls = new Set(), depth = 0, retryCount
         const internalLinks = new Set();
         
         $('a').each((_, element) => {
-
             const href = $(element).attr('href');
             const normalizedUrl = normalizeUrl(url, href);
             if (normalizedUrl) {
@@ -217,33 +256,84 @@ async function scrapeWebsite(url, visitedUrls = new Set(), depth = 0, retryCount
     }
 }
 
-// Vector generation
+// Mistral AI embedding function
 async function generateVector({ text }) {
-    const model = genAI.getGenerativeModel({ model: "text-embedding-004" });
-    const result = await model.embedContent(text);
-    return result.embedding.values;
+    const vectorFunction = async () => {
+        try {
+            const response = await axios.post(
+                `${MISTRAL_BASE_URL}/embeddings`,
+                {
+                    model: 'mistral-embed',
+                    input: [text],
+                    encoding_format: 'float'
+                },
+                {
+                    headers: {
+                        'Authorization': `Bearer ${MISTRAL_API_KEY}`,
+                        'Content-Type': 'application/json'
+                    }
+                }
+            );
+            
+            return response.data.data[0].embedding;
+        } catch (error) {
+            console.error('Mistral embedding error:', error.response?.data || error.message);
+            throw error;
+        }
+    };
+    
+    return await rateLimitedApiCall(vectorFunction);
 }
 
-// Content chunking
-function chunkText(text, maxBytes = 10000) {
-    const encoder = new TextEncoder();
+// Batch embedding function for efficiency
+async function generateVectorsBatch(texts) {
+    const batchFunction = async () => {
+        try {
+            const response = await axios.post(
+                `${MISTRAL_BASE_URL}/embeddings`,
+                {
+                    model: 'mistral-embed',
+                    input: texts,
+                    encoding_format: 'float'
+                },
+                {
+                    headers: {
+                        'Authorization': `Bearer ${MISTRAL_API_KEY}`,
+                        'Content-Type': 'application/json'
+                    }
+                }
+            );
+            
+            return response.data.data.map(item => item.embedding);
+        } catch (error) {
+            console.error('Mistral batch embedding error:', error.response?.data || error.message);
+            throw error;
+        }
+    };
+    
+    return await rateLimitedApiCall(batchFunction);
+}
+
+// Content chunking optimized for Mistral's 8K context
+function chunkText(text, maxTokens = 6000) { // Leave room for other tokens
     const words = text.split(" ");
     let chunks = [];
     let currentChunk = [];
-
-    let currentSize = 0;
+    let currentTokens = 0;
 
     for (const word of words) {
-        const wordSize = encoder.encode(word + " ").length; // Get byte size
+        const wordTokens = Math.ceil(word.length / 4); // Rough token estimation
 
-        if (currentSize + wordSize > maxBytes) {
-            chunks.push(currentChunk.join(" "));
-            currentChunk = [];
-            currentSize = 0;
+        if (currentTokens + wordTokens > maxTokens) {
+            if (currentChunk.length > 0) {
+                chunks.push(currentChunk.join(" "));
+                currentChunk = [];
+                currentTokens = 0;
+            }
         }
 
         currentChunk.push(word);
-        currentSize += wordSize;
+        currentTokens += wordTokens;
     }
 
     if (currentChunk.length > 0) {
@@ -253,50 +343,53 @@ function chunkText(text, maxBytes = 10000) {
     return chunks;
 }
 
-
-// Recursive ingestion
-async function ingestRecursive(url, visitedUrls = new Set(), depth = 0, namespace, maxInternalLinks = 5) {
+// Optimized recursive ingestion with batch processing
+async function ingestRecursive(url, visitedUrls = new Set(), depth = 0, namespace, maxInternalLinks = 3) {
     if (depth > MAX_DEPTH) return;
 
     const result = await scrapeWebsite(url, visitedUrls, depth);
     if (!result) return;
 
-    const index = pc.Index("final-trial");
-
+    const index = pc.Index("askweb-2");
     const contentChunks = chunkText(result.mainContent);
-    for (let i = 0; i < contentChunks.length; i++) {
-        const chunk = contentChunks[i];
-        if (chunk.length < 100) continue;
+    
+    // Limit chunks per page
+    const limitedChunks = contentChunks.slice(0, 8).filter(chunk => chunk.length > 100);
+    
+    if (limitedChunks.length === 0) return;
 
-        try {
-            const embeddingContent = await generateVector({ text: chunk });
-
-            const metadata = {
-                content: chunk,
-                url: result.url,
-                title: result.title,
-                timestamp: new Date().toISOString()
-            };
-
-            await index.namespace(namespace).upsert([{
-                id: `${namespace}_${Date.now()}_${i}`,
-                values: embeddingContent,
-                metadata
-            }]);
+    try {
+        console.log(`🔄 Processing ${limitedChunks.length} chunks for ${url}`);
+        
+        // Use batch processing for efficiency
+        const batchSize = 5; // Process in smaller batches to avoid timeouts
+        for (let i = 0; i < limitedChunks.length; i += batchSize) {
+            const batch = limitedChunks.slice(i, i + batchSize);
+            const embeddings = await generateVectorsBatch(batch);
             
-            console.log(`📤 Inserted chunk ${i + 1}/${contentChunks.length} into namespace: ${namespace}`);
-            await sleep(100);
-        } catch (error) {
-            console.error(`Error inserting chunk ${i}:`, error.message);
-            continue;
+            const upsertData = batch.map((chunk, idx) => ({
+                id: `${namespace}_${Date.now()}_${i + idx}`,
+                values: embeddings[idx],
+                metadata: {
+                    content: chunk,
+                    url: result.url,
+                    title: result.title,
+                    timestamp: new Date().toISOString()
+                }
+            }));
+
+            await index.namespace(namespace).upsert(upsertData);
+            console.log(`📤 Inserted batch ${Math.floor(i/batchSize) + 1} into namespace: ${namespace}`);
         }
+    } catch (error) {
+        console.error(`Error processing chunks for ${url}:`, error.message);
     }
     
-    // Limit the number of internal links scraped
+    // Process internal links
     const linksToScrape = result.internalLinks.slice(0, maxInternalLinks);
     
     for (let link of linksToScrape) {
-        await sleep(1000);
+        await sleep(2000);
         await ingestRecursive(link, visitedUrls, depth + 1, namespace, maxInternalLinks);
     }
 
@@ -306,9 +399,9 @@ async function ingestRecursive(url, visitedUrls = new Set(), depth = 0, namespac
     };
 }
 
-// Question handling
+// Question handling with Mistral embeddings
 async function chat(question, namespace) {
-    const index = pc.Index("final-trial");
+    const index = pc.Index("askweb-2");
     
     const questionEmbedding = await generateVector({ text: question });
     try {
@@ -316,7 +409,6 @@ async function chat(question, namespace) {
             vector: questionEmbedding,
             topK: 5,
             includeMetadata: true,
-            // Query only within this namespace
         });
 
         const context = result.matches
@@ -331,42 +423,62 @@ async function chat(question, namespace) {
     }
 }
 
-// Answer generation
+// Answer generation using Mistral AI chat completions
 async function generateAnswer(question, context) {
-    try {
-        const model = genAI.getGenerativeModel({ model: "gemini-1.5-pro" }, {
-            apiVersion: 'v1beta',
-        });
+    const answerFunction = async () => {
+        try {
+            // Trim context if too long
+            let finalContext = context;
+            while (estimateTokens(question + finalContext) > MAX_TOKENS - 1000) { // Leave room for response
+                finalContext = finalContext.slice(0, -1000);
+            }
 
-        let finalContext = context;
-        while (estimateTokens(question + finalContext) > MAX_TOKENS) {
-            finalContext = finalContext.slice(0, -1000);
+            const response = await axios.post(
+                `${MISTRAL_BASE_URL}/chat/completions`,
+                {
+                    model: 'mistral-small-latest', // Using Mistral Small for text generation
+                    messages: [
+                        {
+                            role: 'system',
+                            content: "You are an assistant with full context of the question. Answer accurately and concisely."
+                        },
+                        {
+                            role: 'user',
+                            content: `Question: ${question}\n\nContext: ${finalContext}\n\nAnswer:`
+                        }
+                    ],
+                    max_tokens: 1000,
+                    temperature: 0.3
+                },
+                {
+                    headers: {
+                        'Authorization': `Bearer ${MISTRAL_API_KEY}`,
+                        'Content-Type': 'application/json'
+                    }
+                }
+            );
+
+            return response.data.choices[0].message.content;
+        } catch (error) {
+            console.error('Mistral chat completion error:', error.response?.data || error.message);
+            throw error;
         }
+    };
 
-        const prompt = `You are an assistant with full context of the question. Answer accurately based on the provided context. If the context doesn't contain enough information to answer the question, say so directly.
-
-        Question: ${question}
-
-        Context: ${finalContext}
-
-        Answer:`;
-
-        const result = await model.generateContent(prompt);
-        return result.response.text();
+    try {
+        return await rateLimitedApiCall(answerFunction);
     } catch (error) {
         console.error('❌ API Error:', error);
 
-        // Categorize and handle different types of errors
-        if (error.message.includes('429')) {
+        if (error.response?.status === 429 || error.message.includes('429')) {
             return "Sorry, I'm experiencing high load. Please try again later.";
-        } else if (error.message.includes('401') || error.message.includes('403')) {
+        } else if (error.response?.status === 401 || error.response?.status === 403) {
             return "Authentication error. Please check the API configuration.";
-        } else if (error.message.includes('500') || error.message.includes('503')) {
+        } else if (error.response?.status >= 500) {
             return "The AI service is currently unavailable. Please try again later.";
-        } else if (error.message.includes('network') || error.message.includes('timeout')) {
+        } else if (error.code === 'ENOTFOUND' || error.code === 'ETIMEDOUT') {
             return "Network error occurred. Please check your internet connection.";
         } else {
-            // Generic error message for unexpected errors
             return "An unexpected error occurred while generating the answer. Please try again.";
         }
     }
@@ -385,7 +497,6 @@ app.post('/api/ask', async (req, res) => {
             });
         }
 
-        // Clean and validate URL
         try {
             url = validateAndFormatUrl(url);
         } catch (error) {
@@ -399,21 +510,10 @@ app.post('/api/ask', async (req, res) => {
         console.log(`🔍 Processing URL: ${url}`);
         console.log(`❓ Question: ${question}`);
 
-        // Generate a consistent namespace for this URL
         const namespace = createNamespaceFromUrl(url);
         console.log(`📁 Using namespace: ${namespace}`);
 
-        // Check Redis cache first
-        const redisKey = `${namespace}:${question}`;
-        const cachedAnswer = await redis.get(redisKey);
-        
-        if (cachedAnswer) {
-            console.log("✅ Retrieved from Redis cache");
-            return res.json(JSON.parse(cachedAnswer));
-        }
-
-        // Check if namespace exists in Pinecone
-        const index = pc.Index("final-trial");
+        const index = pc.Index("askweb-2");
         const stats = await index.describeIndexStats();
         const namespaces = stats.namespaces || {};
         const urlNeedsIngestion = !namespaces[namespace] || namespaces[namespace].vectorCount === 0;
@@ -422,7 +522,6 @@ app.post('/api/ask', async (req, res) => {
         if (urlNeedsIngestion) {
             console.log(`🔄 No data found for this URL, ingesting content...`);
             
-            // Scrape and ingest content
             const visitedUrls = new Set();
             ingestData = await ingestRecursive(url, visitedUrls, 0, namespace);
             
@@ -439,23 +538,19 @@ app.post('/api/ask', async (req, res) => {
             console.log(`📚 Found existing namespace with ${namespaces[namespace].vectorCount} vectors`);
         }
 
-        // Get context and generate answer
         console.log(`🤔 Generating answer for namespace: ${namespace}...`);
         const context = await chat(question, namespace);
         
         if (!context || context.trim().length === 0) {
             const response = {
                 success: true,
-                answer: "Sorry, I couldn't find any relevant information to answer your question. You can try asking diffrent Question!",
+                answer: "Sorry, I couldn't find any relevant information to answer your question. You can try asking a different question!",
                 metadata: {
                     namespace: namespace,
                     url: url,
                     processedAt: new Date().toISOString()
                 }
             };
-            
-            // Cache the response
-            
             
             return res.json(response);
         }
@@ -472,9 +567,6 @@ app.post('/api/ask', async (req, res) => {
             }
         };
         
-        // Cache the response
-       
-        
         res.json(response);
 
     } catch (error) {
@@ -487,17 +579,16 @@ app.post('/api/ask', async (req, res) => {
     }
 });
 
-
-const ping = ()=>{
-const url = 'https://askweb-backend.onrender.com'
-setInterval(async()=>{
-    try {
-        const response = await fetch(url)
-        console("keeping backend alive ping",response.status)
-    } catch (error) {
-        console.log("ping failed",error)
-    }
-},36000000)
+const ping = () => {
+    const url = 'https://askweb-backend.onrender.com'
+    setInterval(async() => {
+        try {
+            const response = await fetch(url)
+            console.log("keeping backend alive ping", response.status)
+        } catch (error) {
+            console.log("ping failed", error)
+        }
+    }, 36000000)
 }
 ping()
 
